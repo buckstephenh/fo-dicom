@@ -1,6 +1,10 @@
 // Copyright (c) 2012-2017 fo-dicom contributors.
 // Licensed under the Microsoft Public License (MS-PL).
 
+using System;
+using CharLS;
+using Dicom.IO.Buffer;
+
 namespace Dicom.Imaging.Codec
 {
     internal static class DicomJpegLsCodecImpl
@@ -10,92 +14,69 @@ namespace Dicom.Imaging.Codec
             DicomPixelData newPixelData,
             DicomJpegLsParams parameters)
         {
-	if ((oldPixelData->PhotometricInterpretation == PhotometricInterpretation::YbrFull422)    ||
-		(oldPixelData->PhotometricInterpretation == PhotometricInterpretation::YbrPartial422) ||
-		(oldPixelData->PhotometricInterpretation == PhotometricInterpretation::YbrPartial420))
-		throw ref new FailureException("Photometric Interpretation '" + oldPixelData->PhotometricInterpretation + "' not supported by JPEG-LS encoder");
+            if (oldPixelData.PhotometricInterpretation == PhotometricInterpretation.YbrFull422 ||
+                oldPixelData.PhotometricInterpretation == PhotometricInterpretation.YbrPartial422 ||
+                oldPixelData.PhotometricInterpretation == PhotometricInterpretation.YbrPartial420)
+                throw new InvalidOperationException(
+                    "Photometric Interpretation '{oldPixelData.PhotometricInterpretation}' not supported by JPEG-LS encoder");
 
-	NativeJpegLSParameters^ jparams = parameters == nullptr ? ref new NativeJpegLSParameters() : parameters;
+            var jparameters = new JlsParameters
+            {
+                width = oldPixelData.Width,
+                height = oldPixelData.Height,
+                bitsPerSample = oldPixelData.BitsStored,
+                stride = oldPixelData.BytesAllocated * oldPixelData.Width * oldPixelData.SamplesPerPixel,
+                components = oldPixelData.SamplesPerPixel,
+                interleaveMode = oldPixelData.SamplesPerPixel == 1
+                    ? InterleaveMode.None
+                    : oldPixelData.PlanarConfiguration == PlanarConfiguration.Interleaved
+                        ? InterleaveMode.Sample
+                        : InterleaveMode.Line,
+                colorTransformation = ColorTransformation.None
+            };
 
-	JlsParameters params = {0};
-	params.width = oldPixelData->Width;
-	params.height = oldPixelData->Height;
-	params.bitsPerSample = oldPixelData->BitsStored;
-	params.stride = oldPixelData->BytesAllocated * oldPixelData->Width * oldPixelData->SamplesPerPixel;
-	params.components = oldPixelData->SamplesPerPixel;
+            for (var frame = 0; frame < oldPixelData.NumberOfFrames; frame++)
+            {
+                var frameData = oldPixelData.GetFrame(frame);
 
-	params.interleaveMode = oldPixelData->SamplesPerPixel == 1
-		? CharlsInterleaveModeType::None :
-		oldPixelData->PlanarConfiguration == PlanarConfiguration::Interleaved
-			? CharlsInterleaveModeType::Sample
-			: CharlsInterleaveModeType::Line;
-	params.colorTransformation = CharlsColorTransformationType::None;
+                // assume compressed frame will be smaller than original
+                var jpegData = new byte[frameData.Size];
 
-	for (int frame = 0; frame < oldPixelData->NumberOfFrames; frame++) {
-		Array<unsigned char>^ frameData = oldPixelData->GetFrame(frame);
+                ulong jpegDataSize;
+                string errorMessage;
+                var err = JpegLs.Encode(frameData.Data, jpegData, jparameters, out jpegDataSize, out errorMessage);
+                if (err != ApiResult.OK) throw new InvalidOperationException(GetErrorMessage(err, errorMessage));
 
-		// assume compressed frame will be smaller than original
-		Array<unsigned char>^ jpegData = ref new Array<unsigned char>(frameData->Length);
+                Array.Resize(ref jpegData, (int) jpegDataSize + ((jpegDataSize & 1) == 1 ? 1 : 0));
 
-		size_t jpegDataSize = 0;
+                newPixelData.AddFrame(new MemoryByteBuffer(jpegData));
+            }
+        }
 
-		char errorMessage[256];
-		CharlsApiResultType err = JpegLsEncode((void*)jpegData->begin(), jpegData->Length, &jpegDataSize, (void*)frameData->begin(), frameData->Length, &params, errorMessage);
-		if (err != CharlsApiResultType::OK) throw ref new FailureException(GetErrorMessage(err));
-
-		Array<unsigned char>^ buffer = ref new Array<unsigned char>(static_cast<unsigned int>(jpegDataSize + ((jpegDataSize & 1) == 1 ? 1 : 0)));
-		Arrays::Copy(jpegData, buffer, static_cast<int>(jpegDataSize));
-
-		newPixelData->AddFrame(buffer);
-		}
-		}
-		
-		internal static void Decode(
+        internal static void Decode(
             DicomPixelData oldPixelData,
             DicomPixelData newPixelData,
             DicomJpegLsParams parameters)
         {
-	for (int frame = 0; frame < oldPixelData->NumberOfFrames; frame++) {
-		Array<unsigned char>^ jpegData = oldPixelData->GetFrame(frame);
+            for (var frame = 0; frame < oldPixelData.NumberOfFrames; frame++)
+            {
+                var jpegData = oldPixelData.GetFrame(frame);
 
-		int frameSize = newPixelData->UncompressedFrameSize; if ((frameSize & 1) == 1) ++frameSize;
-		Array<unsigned char>^ frameData = ref new Array<unsigned char>(frameSize);
+                var frameSize = newPixelData.UncompressedFrameSize;
+                if ((frameSize & 1) == 1) ++frameSize;
+                var frameData = new byte[frameSize];
 
-		JlsParameters params = {0};
+                string errorMessage;
+                var err = JpegLs.Decode(jpegData.Data, frameData, null, out errorMessage);
+                if (err != ApiResult.OK) throw new InvalidOperationException(GetErrorMessage(err, errorMessage));
 
-		char errorMessage[256];
-		CharlsApiResultType err = JpegLsDecode((void*)frameData->begin(), frameData->Length, (void*)jpegData->begin(), jpegData->Length, &params, errorMessage);
-		if (err != CharlsApiResultType::OK) throw ref new FailureException(GetErrorMessage(err));
+                newPixelData.AddFrame(new MemoryByteBuffer(frameData));
+            }
+        }
 
-		newPixelData->AddFrame(frameData);
-		}
-		}
-		
-/*
-static String^ GetErrorMessage(CharlsApiResultType error) {
-	switch (error) {
-	case CharlsApiResultType::InvalidJlsParameters:
-		return "Invalid JPEG-LS parameters";
-	case CharlsApiResultType::ParameterValueNotSupported:
-		return "Parameter value not supported";
-	case CharlsApiResultType::UncompressedBufferTooSmall:
-		return "Uncompressed buffer too small";
-	case CharlsApiResultType::CompressedBufferTooSmall:
-		return "Compressed buffer too small";
-	case CharlsApiResultType::InvalidCompressedData:
-		return "Invalid compressed data";
-	case CharlsApiResultType::TooMuchCompressedData:
-		return "Too much compressed data";
-	case CharlsApiResultType::ImageTypeNotSupported:
-		return "Image type not supported";
-	case CharlsApiResultType::UnsupportedBitDepthForTransform:
-		return "Unsupported bit depth for transform";
-	case CharlsApiResultType::UnsupportedColorTransform:
-		return "Unsupported color transform";
-	default:
-		return "Unknown error";
-	}
-}
-*/
-		}
+        private static string GetErrorMessage(ApiResult error, string errorMessage)
+        {
+            return $"[{error}] {errorMessage}";
+        }
+    }
 }
